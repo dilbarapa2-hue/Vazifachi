@@ -1,12 +1,18 @@
-# Telegram bot message handlers
+# Telegram bot message handlers - Multi-account support
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ContextTypes
-from telegram.constants import ChatAction
+from telegram.ext import ContextTypes, ConversationHandler
 from database import (
-    add_account, get_accounts, add_task, get_pending_tasks,
-    update_task_status, get_statistics, get_logs, add_log
+    add_account, get_accounts, get_pending_tasks, get_active_accounts,
+    get_statistics, get_logs, add_log, disable_account
 )
 import json
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Konversatsiya states
+RECEIVE_PHONE = 1
 
 # Main Menu
 def get_main_menu():
@@ -31,11 +37,12 @@ Vazifachi botiga xush kelibsiz! 🤖
 
 Bu bot sizga @Obunachi_X kanalining vazifalarini avtomatik bajarish imkoniyatini beradi.
 
-<b>Quyidagilarni qila olasiz:</b>
-✅ Telegram akountlarni qo'shish
-📊 Statistikani ko'rish
-📝 Loglarni tekshirish
-🔄 Vazifalarni avtomatik bajarish
+<b>Asosiy Xususiyatlari:</b>
+✅ Bir vaqtda 10 tagacha akount
+🔄 5 ta vazifa parallel bajariladi
+🛡️ Avtomatik xato tuzatish (3 urinish)
+📊 To'liq statistika va loglar
+⚡ Tez va ishonchli bajarilish
 
 <b>Boshlash uchun tugmalardan birini tanlang:</b>
 """
@@ -54,7 +61,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     
     if query.data == "add_account":
-        await add_account_handler(query, user_id)
+        await add_account_handler(query, user_id, context)
     elif query.data == "show_accounts":
         await show_accounts_handler(query, user_id)
     elif query.data == "statistics":
@@ -63,20 +70,36 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await logs_handler(query, user_id)
     elif query.data == "back_to_menu":
         await query.edit_message_text(
-            "<b>Asosiy Menyu</b>",
+            "<b>🏠 Asosiy Menyu</b>",
             reply_markup=get_main_menu(),
             parse_mode='HTML'
         )
+    elif query.data.startswith("delete_account_"):
+        account_id = int(query.data.split("_")[-1])
+        await delete_account_handler(query, user_id, account_id)
 
-async def add_account_handler(query, user_id):
+async def add_account_handler(query, user_id, context):
     """Akaunt qo'shish"""
     add_log(user_id, "Akaunt qo'shish boshlandi")
     
-    text = """
+    # Joriy akountlar sonini tekshirish
+    accounts = get_accounts(user_id)
+    if len(accounts) >= 10:
+        await query.edit_message_text(
+            "❌ <b>Maksimal 10 ta akaunt qo'shishingiz mumkin!</b>\n\n"
+            f"Joriy: {len(accounts)}/10",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Asosiy menyu", callback_data="back_to_menu")]]),
+            parse_mode='HTML'
+        )
+        return
+    
+    text = f"""
 📱 <b>Akaunt qo'shish</b>
 
 Iltimos, Telegram telefon raqamingizni kiriting:
 (Masalan: +998901234567)
+
+<b>Joriy akountlar:</b> {len(accounts)}/10
 """
     
     keyboard = [[InlineKeyboardButton("❌ Bekor qilish", callback_data="back_to_menu")]]
@@ -87,35 +110,44 @@ Iltimos, Telegram telefon raqamingizni kiriting:
         parse_mode='HTML'
     )
     
-    # Kontekstga flag qo'shish
-    from telegram.ext import ConversationHandler
-    from handlers import receive_phone_number
-    
-    return "RECEIVE_PHONE"
+    context.user_data['waiting_for_phone'] = True
+    return RECEIVE_PHONE
 
 async def receive_phone_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Telefon raqamini qabul qilish"""
     user_id = update.effective_user.id
     phone = update.message.text.strip()
     
-    if not phone.startswith('+'):
+    if not context.user_data.get('waiting_for_phone'):
+        return
+    
+    context.user_data['waiting_for_phone'] = False
+    
+    if not phone.startswith('+') or not phone[1:].isdigit():
         await update.message.reply_text(
-            "❌ Noto'g'ri format! Iltimos, +998... formatida kiriting."
+            "❌ <b>Noto'g'ri format!</b>\n\n"
+            "Iltimos, +998... formatida kiriting.",
+            parse_mode='HTML'
         )
-        return "RECEIVE_PHONE"
+        return RECEIVE_PHONE
     
     # Akountni bazaga qo'shish
-    session_name = f"session_{user_id}_{phone}"
+    session_name = f"session_{user_id}_{phone.replace('+', '')}"
     
-    if add_account(user_id, phone, session_name):
+    success, message = add_account(user_id, phone, session_name)
+    
+    if success:
         add_log(user_id, f"Akaunt qo'shildi: {phone}")
         
         text = f"""
 ✅ <b>Akaunt muvaffaqiyatli qo'shildi!</b>
 
-📱 Telefon: <code>{phone}</code>
+📱 <b>Telefon:</b> <code>{phone}</code>
+🔗 <b>Sessiya:</b> <code>{session_name}</code>
 
 Ushbu akount orqali bot sizning vazifalarni avtomatik bajarib boradi.
+
+⏳ <b>Birinchi urinishda 2FA parol kiritish talab qilinishi mumkin.</b>
 """
         
         keyboard = [[InlineKeyboardButton("🏠 Asosiy menyu", callback_data="back_to_menu")]]
@@ -127,8 +159,9 @@ Ushbu akount orqali bot sizning vazifalarni avtomatik bajarib boradi.
         )
     else:
         await update.message.reply_text(
-            "❌ Bu telefon raqami allaqachon ro'yxatdan o'tgan!",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Asosiy menyu", callback_data="back_to_menu")]])
+            f"❌ <b>Xato!</b>\n\n{message}",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Asosiy menyu", callback_data="back_to_menu")]]),
+            parse_mode='HTML'
         )
     
     return ConversationHandler.END
@@ -141,14 +174,27 @@ async def show_accounts_handler(query, user_id):
     
     if not accounts:
         text = "📱 <b>Sizda hali akaunt yo'q</b>\n\nAkaunt qo'shish uchun ➕ tugmasini bosing."
+        keyboard = [[InlineKeyboardButton("🏠 Asosiy menyu", callback_data="back_to_menu")]]
     else:
-        text = "📱 <b>Sizning akountlaringiz:</b>\n\n"
+        text = f"📱 <b>Sizning akountlaringiz ({len(accounts)}/10):</b>\n\n"
+        
         for idx, account in enumerate(accounts, 1):
-            account_id, phone, is_active, created_at = account
+            account_id, phone, is_active, success_count, error_count, last_used = account
+            
             status = "✅ Faol" if is_active else "❌ Nofaol"
-            text += f"{idx}. {phone} - {status}\n"
-    
-    keyboard = [[InlineKeyboardButton("🏠 Asosiy menyu", callback_data="back_to_menu")]]
+            stats = f"✅{success_count} ❌{error_count}"
+            
+            text += f"{idx}. {phone}\n   {status} | {stats}\n"
+        
+        keyboard = []
+        for account in accounts:
+            account_id = account[0]
+            phone = account[1]
+            keyboard.append([
+                InlineKeyboardButton(f"❌ {phone}", callback_data=f"delete_account_{account_id}")
+            ])
+        
+        keyboard.append([InlineKeyboardButton("🏠 Asosiy menyu", callback_data="back_to_menu")])
     
     await query.edit_message_text(
         text,
@@ -156,22 +202,44 @@ async def show_accounts_handler(query, user_id):
         parse_mode='HTML'
     )
 
+async def delete_account_handler(query, user_id, account_id):
+    """Akountni o'chirish"""
+    try:
+        disable_account(account_id)
+        add_log(user_id, f"Akaunt o'chirildi: {account_id}")
+        
+        await query.answer("✅ Akaunt o'chirildi", show_alert=True)
+        await show_accounts_handler(query, user_id)
+    except Exception as e:
+        logger.error(f"Akaunt o'chirishda xato: {e}")
+        await query.answer("❌ Xato yuz berdi", show_alert=True)
+
 async def statistics_handler(query, user_id):
     """Statistikani ko'rsatish"""
     add_log(user_id, "Statistika ko'rildi")
     
-    stats = get_statistics(user_id)
+    accounts = get_accounts(user_id)
     
-    text = f"""
+    if not accounts:
+        text = "📊 <b>Statistika mavjud emas</b>\n\nAkaunt qo'shing va vazifalar qo'shing."
+    else:
+        stats = get_statistics(user_id)
+        
+        text = f"""
 📊 <b>Sizning Statistikangiz</b>
 
-📌 <b>Jami vazifalar:</b> {stats['total']}
-✅ <b>Tugallangan:</b> {stats['completed']}
-❌ <b>Muvaffaqiyatsiz:</b> {stats['failed']}
-⏳ <b>Kutilmoqda:</b> {stats['total'] - stats['completed'] - stats['failed']}
+<b>Umumiy:</b>
+📌 Jami vazifalar: {stats['total']}
+✅ Tugallangan: {stats['completed']}
+❌ Muvaffaqiyatsiz: {stats['failed']}
+⏳ Kutilmoqda: {stats['pending']}
 
-<b>Bugungi sana:</b> Yangilanmoqda...
+<b>Akountlar bo'yicha:</b>
 """
+        for account in accounts:
+            account_id, phone, is_active, success_count, error_count, last_used = account
+            status = "✅" if is_active else "❌"
+            text += f"\n{status} {phone}: ✅{success_count} | ❌{error_count}"
     
     keyboard = [[InlineKeyboardButton("🏠 Asosiy menyu", callback_data="back_to_menu")]]
     
@@ -185,12 +253,18 @@ async def logs_handler(query, user_id):
     """Loglarni ko'rsatish"""
     add_log(user_id, "Loglar ko'rildi")
     
-    logs_text = get_logs(user_id)
+    logs_text = get_logs(user_id, limit=30)
     
-    text = f"""
+    if logs_text == "📝 Loglar mavjud emas":
+        text = logs_text
+    else:
+        # Loglarni qisqartirish
+        lines = logs_text.split('\n')
+        limited_logs = '\n'.join(lines[-20:]) if len(lines) > 20 else logs_text
+        text = f"""
 📝 <b>Sizning Loglaringiz</b>
 
-<code>{logs_text}</code>
+<code>{limited_logs}</code>
 """
     
     keyboard = [[InlineKeyboardButton("🏠 Asosiy menyu", callback_data="back_to_menu")]]
@@ -203,6 +277,8 @@ async def logs_handler(query, user_id):
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Xato handler"""
-    import logging
-    logger = logging.getLogger(__name__)
     logger.error(msg="Update caused error", exc_info=context.error)
+    
+    if update and update.effective_user:
+        user_id = update.effective_user.id
+        add_log(user_id, f"Bot xatosi: {context.error}")
